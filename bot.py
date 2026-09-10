@@ -18,8 +18,10 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # =========================
 
-TOKEN = "твой_токен"
-FACEIT_API_KEY = "твой_ключ"
+import os
+
+TOKEN = os.getenv("TOKEN")
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY")
 MAX_PLAYERS = 10
 DB_NAME = "cs_team.db"
 
