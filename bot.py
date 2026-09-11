@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import re
+import time
 from urllib.request import Request, urlopen
 from urllib.parse import quote
 
@@ -363,6 +364,7 @@ main_keyboard = ReplyKeyboardMarkup(
         ["🔄 Обновить ELO", "🎮 Сегодня играю"],
         ["👥 Кто сегодня играет"],
         ["📊 Все ELO"],
+        ["📈 Моя статистика"],
     ],
     resize_keyboard=True
 )
@@ -759,6 +761,269 @@ async def all_elo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+# =========================
+# СТАТИСТИКА FACEIT
+# =========================
+
+def get_faceit_history(faceit_id, limit=100):
+    url = (
+        f"https://open.faceit.com/data/v4/players/"
+        f"{faceit_id}/history?game=cs2&limit={limit}"
+    )
+    data = faceit_request(url)
+    return data.get("items", [])
+
+
+def get_faceit_player_stats(faceit_id, limit=100):
+    url = (
+        f"https://open.faceit.com/data/v4/players/"
+        f"{faceit_id}/games/cs2/stats?limit={limit}"
+    )
+    data = faceit_request(url)
+    return data.get("items", [])
+
+
+def _normalize_stats(item):
+    stats = item.get("stats", {})
+
+    if (
+        isinstance(stats, dict)
+        and isinstance(stats.get("stats"), dict)
+    ):
+        stats = stats["stats"]
+
+    return stats if isinstance(stats, dict) else {}
+
+
+def _get_number(stats, *keys):
+    for key in keys:
+        value = stats.get(key)
+        if value is None:
+            continue
+
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+def _get_int(stats, *keys):
+    value = _get_number(stats, *keys)
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _get_rating(stats):
+    # Если FACEIT когда-нибудь начнёт отдавать
+    # индивидуальный Rating через этот endpoint,
+    # бот автоматически его подхватит.
+    possible_keys = (
+        "Rating",
+        "rating",
+        "FACEIT Rating",
+        "Faceit Rating",
+        "faceit_rating",
+        "faceitRating",
+    )
+
+    for key in possible_keys:
+        value = stats.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def calculate_faceit_stats(faceit_id, limit=100):
+    history = get_faceit_history(faceit_id, limit=limit)
+    player_stats = get_faceit_player_stats(faceit_id, limit=limit)
+
+    kills = 0
+    deaths = 0
+    wins = 0
+    losses = 0
+    processed = 0
+    ratings = []
+
+    for item in player_stats[:limit]:
+        stats = _normalize_stats(item)
+
+        if not stats:
+            continue
+
+        processed += 1
+
+        kills += _get_int(stats, "Kills", "kills")
+        deaths += _get_int(stats, "Deaths", "deaths")
+
+        result = str(
+            stats.get("Result", stats.get("result", ""))
+        ).strip()
+
+        if result == "1":
+            wins += 1
+        elif result == "0":
+            losses += 1
+
+        rating = _get_rating(stats)
+
+        if rating is not None:
+            ratings.append(rating)
+
+    total = wins + losses
+
+    kd = (
+        kills / deaths
+        if deaths > 0
+        else 0
+    )
+
+    winrate = (
+        wins / total * 100
+        if total > 0
+        else 0
+    )
+
+    average_rating = (
+        sum(ratings) / len(ratings)
+        if ratings
+        else None
+    )
+
+    best_rating = (
+        max(ratings)
+        if ratings
+        else None
+    )
+
+    return {
+        "matches": len(history),
+        "processed": processed,
+        "kills": kills,
+        "deaths": deaths,
+        "kd": kd,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "ratings": ratings,
+        "average_rating": average_rating,
+        "best_rating": best_rating,
+    }
+
+
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
+    player = get_player(user_id)
+
+    if player is None:
+        await update.message.reply_text(
+            "Сначала нажми /start",
+            reply_markup=main_keyboard
+        )
+        return
+
+    faceit_id = player[4]
+    nickname = player[5]
+
+    if not faceit_id:
+        context.user_data["waiting_for_faceit"] = True
+
+        await update.message.reply_text(
+            "🔗 Сначала отправь ссылку на свой FACEIT-профиль.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    await update.message.reply_text(
+        "📊 Загружаю статистику последних 100 матчей...\n"
+        "Это может занять несколько секунд."
+    )
+
+    try:
+        result = calculate_faceit_stats(
+            faceit_id,
+            limit=100
+        )
+
+        ratings = result["ratings"]
+
+        count_180 = sum(
+            1 for x in ratings if x >= 1.80
+        )
+        count_170 = sum(
+            1 for x in ratings if x >= 1.70
+        )
+        count_160 = sum(
+            1 for x in ratings if x >= 1.60
+        )
+        count_150 = sum(
+            1 for x in ratings if x >= 1.50
+        )
+
+        if result["average_rating"] is None:
+            average_rating = "—"
+            rating_note = (
+                "\n\n⚠️ Личный FACEIT Rating пока не отдаётся "
+                "через публичный Data API."
+            )
+        else:
+            average_rating = f"{result['average_rating']:.2f}"
+            rating_note = ""
+
+        if result["best_rating"] is None:
+            best_rating = "—"
+        else:
+            best_rating = f"{result['best_rating']:.2f}"
+
+        message = (
+            f"🎮 FACEIT Stats — {nickname}\n\n"
+            f"📊 Последних матчей: {result['matches']}\n"
+            f"🔎 Обработано матчей: {result['processed']}\n\n"
+
+            f"🔥 Rating ≥ 1.80: {count_180}\n"
+            f"⚡ Rating ≥ 1.70: {count_170}\n"
+            f"📈 Rating ≥ 1.60: {count_160}\n"
+            f"📊 Rating ≥ 1.50: {count_150}\n\n"
+
+            f"📈 Средний Rating: {average_rating}\n"
+            f"🚀 Лучший Rating: {best_rating}\n\n"
+
+            f"🎯 K/D: {result['kd']:.2f}\n"
+            f"🔫 Kills: {result['kills']}\n"
+            f"💀 Deaths: {result['deaths']}\n\n"
+
+            f"🏆 Победы: {result['wins']}\n"
+            f"💀 Поражения: {result['losses']}\n"
+            f"📌 Winrate: {result['winrate']:.1f}%"
+            f"{rating_note}"
+        )
+
+        await update.message.reply_text(
+            message,
+            reply_markup=main_keyboard
+        )
+
+    except Exception as e:
+        print("STATS ERROR:", repr(e))
+
+        await update.message.reply_text(
+            "❌ Не удалось получить статистику FACEIT.\n\n"
+            "Попробуй ещё раз через несколько секунд.",
+            reply_markup=main_keyboard
+        )
+
+
 # =========================
 # НАЗАД
 # =========================
@@ -864,6 +1129,16 @@ def main():
         MessageHandler(
             filters.TEXT & filters.Regex("^⬅️ Назад$"),
             back
+        )
+    )
+
+
+    # МОЯ СТАТИСТИКА
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex("^📈 Моя статистика$"),
+            my_stats
         )
     )
 
